@@ -1,7 +1,7 @@
 ﻿// GolBet.Repositories/Implementations/MatchRepository.cs
 using GolBet.Entities;
 using GolBet.Entities.enums;
-using GolBet.Repositories.data;
+using GolBet.Repositories.Data;
 using GolBet.Repositories.Interfaces;
 using Microsoft.EntityFrameworkCore;
 
