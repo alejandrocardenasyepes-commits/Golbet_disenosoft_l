@@ -12,24 +12,32 @@ namespace GolBet.Services.Implementations;
 public class MatchService : IMatchService
 {
     private readonly IMatchRepository _matchRepository;
+    private readonly IBetRepository _betRepository;
     private readonly IMapper _mapper;
 
-    public MatchService(IMatchRepository matchRepository, IMapper mapper)
+    public MatchService(
+        IMatchRepository matchRepository,
+        IBetRepository betRepository,
+        IMapper mapper)
     {
         _matchRepository = matchRepository;
+        _betRepository = betRepository;
         _mapper = mapper;
     }
 
-    public async Task<IEnumerable<MatchDto>> GetBoardAsync(MatchStatus? status = null, string? search = null) // NUEVO
+    public async Task<IEnumerable<MatchDto>> GetBoardAsync(MatchStatus? status = null, string? search = null)
     {
-        var matches = await _matchRepository.GetAllWithTeamsAsync(status, search); // NUEVO
+        var matches = await _matchRepository.GetAllWithTeamsAsync(status, search);
         return _mapper.Map<IEnumerable<MatchDto>>(matches);
     }
+
     public async Task<MatchDetailDto?> GetDetailAsync(int id)
     {
         var match = await _matchRepository.GetByIdWithDetailsAsync(id);
-        return match is null ? null : _mapper.Map<MatchDetailDto>(match);
+        return match is null ? null : _mapper.Map<MatchDetailDto>(match); //If ternario
     }
+
+    // GolBet.Services/Implementations/MatchService.cs  (agregar)
     public async Task<MatchFormDto?> GetForEditAsync(int id)
     {
         var match = await _matchRepository.GetByIdAsync(id);
@@ -64,7 +72,74 @@ public class MatchService : IMatchService
     public async Task DeactivateAsync(int id)
         => await _matchRepository.DeactivateAsync(id);
 
+    public async Task StartMatchAsync(int id)
+    {
+        var match = await _matchRepository.GetByIdAsync(id)
+            ?? throw new KeyNotFoundException($"Match {id} not found.");
+
+        if (match.Status != MatchStatus.Scheduled)
+            throw new InvalidOperationException(
+                "Solo un partido programado puede iniciarse.");
+
+        match.Status = MatchStatus.InProgress;   // betting closes (rule #1 reads this)
+        await _matchRepository.UpdateAsync(match);
+    }
+
+    public async Task<ResolutionSummaryDto> CloseMatchAsync(MatchResultFormDto dto)
+    {
+        var match = await _matchRepository.GetByIdAsync(dto.MatchId)
+            ?? throw new KeyNotFoundException($"Match {dto.MatchId} not found.");
+
+        // State machine guards (first idempotence belt)
+        if (match.Status == MatchStatus.Finished)
+            throw new InvalidOperationException(
+                "Este partido ya fue cerrado y sus apuestas resueltas.");
+
+        if (match.Status != MatchStatus.InProgress)
+            throw new InvalidOperationException(
+                "El partido debe estar «En juego» para cerrarse. Inícialo primero.");
+
+        // 1. Record the final score and the new state
+        match.HomeGoals = dto.HomeGoals;
+        match.AwayGoals = dto.AwayGoals;
+        match.Status = MatchStatus.Finished;
+
+        // 2. Compute the winning pick from the score
+        var winningPick = GetWinningPick(dto.HomeGoals, dto.AwayGoals);
+
+        // 3. Resolve every PENDING bet (second idempotence belt: only Pending arrive)
+        var pendingBets = await _betRepository.GetPendingByMatchAsync(match.Id);
+        var summary = new ResolutionSummaryDto { ResolvedBets = pendingBets.Count };
+
+        foreach (var bet in pendingBets)
+        {
+            if (bet.Pick == winningPick)
+            {
+                bet.Status = BetStatus.Won;
+                var payout = bet.Amount * bet.OddsAtPlacement;   // FROZEN odds pay
+                bet.User.Balance += payout;                      // the win lands
+                summary.WonBets++;
+                summary.TotalPaid += payout;
+            }
+            else
+            {
+                bet.Status = BetStatus.Lost;   // stake was deducted at placement
+            }
+        }
+
+        // 4. ONE save: the match, every bet and every balance, in ONE transaction
+        await _matchRepository.UpdateAsync(match);
+
+        return summary;
+    }
+
+    private static BetPick GetWinningPick(int homeGoals, int awayGoals)
+        => homeGoals > awayGoals ? BetPick.Home
+         : homeGoals < awayGoals ? BetPick.Away
+         : BetPick.Draw;
+
     // ---- Business rules (Guía, regla #1 y afines) ----
+
     private static void ValidateBusinessRules(MatchFormDto dto)
     {
         if (dto.HomeTeamId == dto.AwayTeamId)
@@ -75,5 +150,4 @@ public class MatchService : IMatchService
             throw new InvalidOperationException(
                 "La fecha del partido debe ser futura.");
     }
-
 }
